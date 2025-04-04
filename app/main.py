@@ -1,16 +1,17 @@
 import asyncio
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, Response as FastAPIResponse, HTTPException
 from mcp.server.lowlevel import Server as MCPServer
 from mcp.server.sse import SseServerTransport
-# Import specific types if possible, otherwise define manually or handle dynamically
-# from mcp.types import Tool, TextContent # Example if types were available
 import requests
 import logging
 import os
 import uvicorn
 from pydantic import BaseModel, Field
-from starlette.responses import StreamingResponse # Needed for SSE
-from starlette.routing import Route, Mount # Needed if using Starlette directly for SSE part
+from typing import ClassVar
+# Import Starlette components for direct SSE handling
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.responses import Response as StarletteResponse # Avoid name clash
 
 # Configure basic logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -58,14 +59,13 @@ coingecko_tool_definition = {
 # Create the core MCP Server instance
 mcp_server = MCPServer(
     name="coingecko-price-server-py-sse",
-    version="1.2.0" # Incremented version
+    version="1.2.0"
 )
 
 # Register tool handlers using decorators on the MCPServer instance
 @mcp_server.list_tools()
 async def list_tools():
     logger.info("Handling listTools request")
-    # The SDK decorator likely handles formatting this into the full JSON-RPC response
     return [coingecko_tool_definition]
 
 @mcp_server.call_tool()
@@ -74,105 +74,68 @@ async def call_tool(name: str, arguments: dict):
     if name == "get_coingecko_price":
         try:
             validated_input = CoinGeckoPriceInput(**arguments)
-            # The SDK decorator likely handles formatting this into the full JSON-RPC response
             return await get_coingecko_price_logic(validated_input.token_id)
         except Exception as e:
             logger.error(f"Error during tool execution for {name}: {e}")
-            raise # Re-raise for the decorator to handle
+            raise
     else:
         logger.error(f"Unknown tool called: {name}")
-        # Raise an error that the SDK decorator can convert to MethodNotFound
-        # Using a specific MCPError might be better if importable, otherwise ValueError
         raise ValueError(f"Unknown tool: {name}")
 
+# --- SSE Transport and Starlette App Setup ---
+# Initialize the SSE transport, specifying the path for POST messages
+# This instance will be shared across connections in this simple setup
+sse_transport = SseServerTransport("/messages/")
+logger.info("SseServerTransport initialized for /messages/")
+
+async def handle_sse_endpoint(scope, receive, send):
+    """
+    Handles incoming GET requests to establish the SSE stream using Starlette directly.
+    Connects the MCP server logic to the transport for this connection.
+    """
+    logger.info(f"Incoming SSE connection request (Scope: {scope.get('path')})")
+    # Use the transport's connect_sse method with low-level ASGI args
+    try:
+        async with sse_transport.connect_sse(scope, receive, send) as streams:
+            logger.info("SSE stream connected via transport.connect_sse. Running MCP server logic.")
+            # Run the MCP server logic, connecting it to the streams provided by the transport
+            await mcp_server.run(streams, streams) # Pass streams for input and output
+            logger.info("MCP server run loop finished for this SSE connection.")
+    except asyncio.CancelledError:
+        logger.info("SSE connection cancelled/closed by client.")
+    except Exception as e:
+        logger.error(f"Error during SSE handling: {e}", exc_info=True)
+    finally:
+        logger.info("SSE connection handler finished.")
+        # Note: Transport cleanup might be handled internally by connect_sse context manager
+
+# Create a Starlette app specifically for the SSE routes
+sse_routes = [
+    Route("/sse/", endpoint=handle_sse_endpoint), # GET endpoint for SSE stream
+    Mount("/messages/", app=sse_transport.handle_post_message) # POST endpoint for client messages
+]
+sse_app = Starlette(routes=sse_routes)
+
 # --- FastAPI App Setup ---
+# Create the main FastAPI application instance
 app = FastAPI(title="CoinGecko Price MCP Server (FastAPI/SSE)", version="1.2.0")
 
-# Store the active transport instance (simple approach for single client)
-active_transport: SseServerTransport | None = None
+# Mount the Starlette SSE app onto the main FastAPI app
+# Requests to /sse/ and /messages/ will now be handled by sse_app
+app.mount("/", sse_app)
 
-# 1. SSE Endpoint (GET /sse) - Using Starlette's StreamingResponse via FastAPI
-@app.get("/sse/") # Note the trailing slash
-async def handle_sse_connection(request: Request):
-    global active_transport
-    logger.info(f"Incoming SSE connection request: {request.url}")
-
-    # Create the SSE transport instance, specifying the path for POST messages
-    transport = SseServerTransport("/messages/") # Path relative to root
-    active_transport = transport # Store for the POST handler
-    logger.info("SseServerTransport initialized for /messages/")
-
-    async def event_stream():
-        # Use the transport's connect_sse method as an async generator
-        try:
-            async with transport.connect_sse(request) as streams:
-                logger.info("SSE stream connected via transport.connect_sse. Running MCP server logic.")
-                # Run the MCP server logic, connecting it to the streams provided by the transport
-                await mcp_server.run(streams, streams) # Pass streams for input and output
-                logger.info("MCP server run loop finished for this SSE connection.")
-        except asyncio.CancelledError:
-            logger.info("SSE connection cancelled/closed by client.")
-        except Exception as e:
-            logger.error(f"Error during SSE streaming: {e}", exc_info=True)
-        finally:
-            logger.info("Cleaning up SSE connection.")
-            # Clear the active transport when the connection closes
-            # Check if it's still the same instance before clearing
-            global active_transport
-            if active_transport == transport:
-                active_transport = None
-
-    # Return a StreamingResponse, which FastAPI/Starlette handles correctly for SSE
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
-
-
-# 2. Message Endpoint (POST /messages)
-@app.post("/messages/") # Note the trailing slash
-async def handle_post_message(request: Request):
-    logger.info("Received POST /messages request")
-    if active_transport and hasattr(active_transport, 'handle_post_message'):
-        # Delegate the handling of the POST request to the active transport instance
-        # The transport needs the raw Starlette request/response handling capability
-        # This might require adapting how handle_post_message is called if it expects
-        # Starlette's scope/receive/send directly instead of a FastAPI Request.
-        # For now, assuming it can work with FastAPI's Request or we adapt later.
-        logger.info("Delegating POST request to active SseServerTransport")
-        # This part is tricky - SseServerTransport might expect Starlette's low-level ASGI interface.
-        # We might need to wrap this differently or use Starlette directly as in Heurist example.
-        # Let's try a simplified delegation first. If it fails, we'll need Starlette mounting.
-        try:
-            # Attempt direct delegation (might fail if transport expects ASGI scope/receive/send)
-            # The transport's handle_post_message should ideally parse the body,
-            # feed the request to mcp_server via its internal streams, and handle the response.
-            # It might need to return a Starlette Response object.
-            # This is the most uncertain part without exact SDK docs for handle_post_message.
-            # Let's assume it handles the request and returns None or a response object.
-             response = await active_transport.handle_post_message(request)
-             if response:
-                 return response
-             else:
-                 # If it handles internally and doesn't return a response object
-                 return Response(status_code=202, content="Request processed via SSE")
-
-        except Exception as e:
-             logger.error(f"Error delegating POST to transport: {e}", exc_info=True)
-             raise HTTPException(status_code=500, detail="Error processing message")
-
-    else:
-        logger.error("Received POST /messages but no active SSE transport or handle_post_message method found.")
-        raise HTTPException(status_code=400, detail="No active SSE connection or transport cannot handle POST.")
-
-
-# Basic root endpoint
-@app.get("/")
-def read_root():
-    return {"message": "CoinGecko Price MCP Server (FastAPI/SSE) is running."}
-
+# Basic root endpoint on FastAPI for info
+@app.get("/info", tags=["General"]) # Use a different path to avoid conflict with sse_app mount
+async def root():
+    return {
+        "message": "CoinGecko Price MCP Server is running.",
+        "sse_endpoint": "/sse/",
+        "message_endpoint": "/messages/"
+        }
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    # Changed default port to 8001 to avoid conflict
-    port = int(os.getenv("PORT", 8001))
+    port = int(os.getenv("PORT", 8000)) # Revert default port back for Render
     logger.info(f"Starting FastAPI server with Uvicorn on port {port}")
-    # Use uvicorn to run the FastAPI app
+    # Use uvicorn to run the FastAPI app (which now includes the mounted SSE Starlette app)
     uvicorn.run(app, host="0.0.0.0", port=port)
