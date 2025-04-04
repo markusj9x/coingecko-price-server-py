@@ -68,8 +68,8 @@ async def get_coingecko_price_logic(token_id: str) -> dict:
 
 # --- Define MCP Tool Class ---
 class CoinGeckoPriceTool(Tool):
-    name = "get_coingecko_price"
-    description = "Get the current price of a cryptocurrency from CoinGecko using its ID."
+    name: str = "get_coingecko_price" # Added type annotation
+    description: str = "Get the current price of a cryptocurrency from CoinGecko using its ID." # Added type annotation for consistency
     input_model = CoinGeckoPriceInput # Use Pydantic model for validation
 
     async def execute(self, input_data: CoinGeckoPriceInput) -> dict:
