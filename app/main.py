@@ -79,7 +79,8 @@ mcp = FastMCP(
 # Define the MCP tool using the @mcp.tool decorator
 # FastMCP handles input validation using the Pydantic model (CoinGeckoPriceInput)
 # and converts exceptions into appropriate MCP error responses.
-@mcp.tool(input_model=CoinGeckoPriceInput)
+# FastMCP infers the schema from the Pydantic type hint below.
+@mcp.tool()
 def get_coingecko_price(input_data: CoinGeckoPriceInput) -> dict:
     """
     Get the current price of a cryptocurrency from CoinGecko using its ID.
