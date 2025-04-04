@@ -1,33 +1,33 @@
-from fastapi import FastAPI, HTTPException
-from mcp.server.fastmcp import FastMCP
-from .sse import create_sse_app # Import the function to create the SSE app
-import requests # For making HTTP requests to CoinGecko
+import asyncio
+from mcp import MCPServer, Tool
+import requests
 import logging
-from pydantic import BaseModel, Field
+import os
+from pydantic import BaseModel, Field # Keep Pydantic for input validation
 
 # Configure basic logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- Pydantic Models for Tool Input ---
-# Define input schema using Pydantic for automatic validation
 class CoinGeckoPriceInput(BaseModel):
     token_id: str = Field(..., description="The CoinGecko ID of the token (e.g., 'bitcoin', 'ethereum').")
 
 # --- CoinGecko API Logic ---
-def get_coingecko_price_logic(token_id: str) -> dict:
+# Make this an async function as MCP tool execution might be async
+async def get_coingecko_price_logic(token_id: str) -> dict:
     """
-    Fetches the price from CoinGecko API.
+    Fetches the price from CoinGecko API asynchronously.
 
     Args:
         token_id: The CoinGecko ID of the token.
 
     Returns:
-        A dictionary containing the price or an error message.
+        A dictionary containing the price or an error message suitable for MCP response.
     """
     if not token_id or not isinstance(token_id, str):
         logger.error("Invalid token_id provided.")
-        # Raise exception for FastMCP to handle and convert to MCP error
+        # Raise standard exceptions; MCPServer should handle converting them
         raise ValueError("Invalid or missing token_id parameter.")
 
     api_url = "https://api.coingecko.com/api/v3/simple/price"
@@ -37,7 +37,9 @@ def get_coingecko_price_logic(token_id: str) -> dict:
     }
     try:
         logger.info(f"Querying CoinGecko API for token: {token_id}")
-        response = requests.get(api_url, params=params, timeout=10) # Added timeout
+        # Use an async HTTP client if available and needed, or run sync requests
+        # For simplicity here, using sync requests (consider httpx for async)
+        response = await asyncio.to_thread(requests.get, api_url, params=params, timeout=10)
         response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
         data = response.json()
 
@@ -63,51 +65,40 @@ def get_coingecko_price_logic(token_id: str) -> dict:
         raise RuntimeError(f"An unexpected error occurred: {e}")
 
 
-# --- FastAPI and MCP Setup ---
-# Create the main FastAPI application instance
-app = FastAPI(title="CoinGecko Price MCP Server", version="1.0.0")
+# --- Define MCP Tool Class ---
+class CoinGeckoPriceTool(Tool):
+    name = "get_coingecko_price"
+    description = "Get the current price of a cryptocurrency from CoinGecko using its ID."
+    input_model = CoinGeckoPriceInput # Use Pydantic model for validation
 
-# Create the FastMCP instance, associating it with the FastAPI app
-# FastMCP automatically creates necessary MCP endpoints (like /mcp.json)
-mcp = FastMCP(
-    "coingecko-price-server-py", # Server name
-    version="1.0.0",
-    title="CoinGecko Price Server (Python/SSE)",
-    description="Provides CoinGecko cryptocurrency prices via MCP SSE transport."
-)
-
-# Define the MCP tool using the @mcp.tool decorator
-# FastMCP handles input validation using the Pydantic model (CoinGeckoPriceInput)
-# and converts exceptions into appropriate MCP error responses.
-# FastMCP infers the schema from the Pydantic type hint below.
-@mcp.tool()
-def get_coingecko_price(input_data: CoinGeckoPriceInput) -> dict:
-    """
-    Get the current price of a cryptocurrency from CoinGecko using its ID.
-    """
-    logger.info(f"Executing tool 'get_coingecko_price' for token_id: {input_data.token_id}")
-    # The logic function returns the structure needed for the 'result' field
-    # of the MCP CallToolResponse. FastMCP wraps this correctly.
-    return get_coingecko_price_logic(input_data.token_id)
+    async def execute(self, input_data: CoinGeckoPriceInput) -> dict:
+        """
+        Executes the tool logic.
+        """
+        logger.info(f"Executing tool '{self.name}' for token_id: {input_data.token_id}")
+        # Call the async logic function
+        # MCPServer will handle wrapping the result/exception into the MCP response format
+        return await get_coingecko_price_logic(input_data.token_id)
 
 
-# --- Mount SSE App ---
-# Create the Starlette app that handles SSE transport using the function from sse.py
-sse_app = create_sse_app(mcp)
+# --- Main Server Execution ---
+if __name__ == "__main__":
+    # Create the MCP Server instance
+    server = MCPServer(
+        name="coingecko-price-server-py-sse",
+        version="1.1.0",
+        title="CoinGecko Price Server (Python/SSE - Simplified)",
+        description="Provides CoinGecko cryptocurrency prices via MCP SSE transport using serve_sse."
+    )
 
-# Mount the SSE Starlette app onto the main FastAPI app at the root path.
-# Requests to /sse/ and /messages/ will be handled by the sse_app.
-app.mount("/", sse_app)
+    # Add the tool instance to the server
+    server.add_tool(CoinGeckoPriceTool())
+    logger.info(f"Tool '{CoinGeckoPriceTool.name}' added to server.")
 
-# --- Optional: Add a simple root endpoint for basic info ---
-@app.get("/info", tags=["General"])
-async def root():
-    return {
-        "message": "CoinGecko Price MCP Server is running.",
-        "mcp_spec": "/mcp.json",
-        "sse_endpoint": "/sse/",
-        "message_endpoint": "/messages/"
-        }
+    # Get port from environment variable or default
+    port = int(os.getenv("PORT", 8000)) # Use 8000 as default if PORT not set
 
-# Note: To run this locally, use: uvicorn app.main:app --reload --port 8000
-# The FastMCP instance automatically adds necessary MCP routes to the 'app'
+    logger.info(f"Starting MCP SSE server on port {port}...")
+    # Use the serve_sse method provided by the SDK
+    # This presumably handles the two-endpoint logic internally.
+    server.serve_sse(port=port, host="0.0.0.0") # Bind to all interfaces
