@@ -1,5 +1,6 @@
 import asyncio
-from mcp import MCPServer, Tool
+from mcp.server.lowlevel import Server as MCPServer # Import from submodule and alias
+from mcp.tool import Tool # Attempt import from submodule
 import requests
 import logging
 import os
